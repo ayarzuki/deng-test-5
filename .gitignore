@@ -1,1 +1,6 @@
 .env
+__pycache__/
+*.pyc
+/src/__pycache__/
+/src/*.pyc
+src/__pycache__/hotel_page.cpython-310.pyc

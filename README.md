@@ -25,18 +25,6 @@ python src/proxy_scraper.py
 
 Results are saved to `output/tui_formentera_packages.json`.
 
-### Legacy Scrapers
-
-The repository also contains earlier scraper attempts that may be useful as reference or fallback:
-
-```bash
-# Selenium-based scraper (blocked by Akamai without proxy)
-python src/scraper.py [--headless] [--max-hotels N]
-
-# HTTP scraper using copied browser session headers/cookies
-python src/http_scraper.py
-```
-
 ## .env Configuration
 
 The `.env` file contains IPRoyal residential proxy credentials used by `local_proxy.py`:
@@ -87,20 +75,17 @@ Results are saved to `output/tui_formentera_packages.json` with the following fi
 
 ## Project Structure
 
-```
+```text
 ├── .env                             # Proxy credentials (not committed)
+├── .gitignore                       # Specifies intentionally untracked files to ignore
 ├── requirements.txt                 # Python dependencies
-├── README.md
-├── src/
-│   ├── proxy_scraper.py             # Main scraper (nodriver + local proxy)
-│   ├── local_proxy.py               # Local TCP proxy forwarding to IPRoyal NL
-│   ├── scraper.py                   # Legacy Selenium-based scraper
-│   ├── http_scraper.py              # Legacy HTTP scraper with copied cookies
-│   ├── listing_page.py              # Legacy listing page extraction (Selenium)
-│   ├── hotel_page.py                # Legacy hotel page extraction (Selenium)
-│   └── utils.py                     # Helpers (logging, delay, retry)
-└── output/
-    └── tui_formentera_packages.json # Scraper output
+├── README.md                        # Project documentation
+├── src/                             # Source code folder
+│   ├── proxy_scraper.py             # Main scraper. Highly integrated script using nodriver and local proxy to bypass Akamai and extract all data including flights.
+│   ├── local_proxy.py               # Local TCP proxy. Forwards traffic to IPRoyal NL with auth headers to bypass Bot Manager smoothly.
+│   └── utils.py                     # Shared helpers (e.g., logging setup).
+└── output/                          # Generated outputs directory
+    └── tui_formentera_packages.json # Final JSON output containing all extracted travel packages.
 ```
 
 ## How It Works
@@ -122,8 +107,9 @@ For each hotel, the scraper:
    - **Room name** from `.hdr-room`
    - **Departure date** and **duration** from `.date` and `.duration-day`
    - **Price** from `.price-detail` (parsing "Prijs per persoon vanaf X")
-5. Iterates airport tabs (`.airports button`) — clicking each one and reading the updated price
-6. Expands "Bekijk meer vertrekluchthavens" if available to reveal additional airports
+5. Interacts with the flight popup (`ovl-flightchoice`) to extract exact outbound and return flight information (times, airline).
+6. Iterates airport tabs (`.airports button`) — clicking each one and reading the updated per-airport price
+7. Expands "Bekijk meer vertrekluchthavens" if available to reveal additional airports
 
 ## Assumptions
 
@@ -135,8 +121,7 @@ For each hotel, the scraper:
 
 ## Limitations
 
-- **Flight details**: TUI does not show flight times or airline on the hotel pricing page; these only appear in the booking flow
-- **Tourist tax**: Not displayed at the pricing overview level
+- **Tourist tax**: Not always clearly displayed at the pricing overview level
 - **Availability**: Some hotels show "Bekijk beschikbaarheid" instead of pricing when no dates are available — these return minimal data
 - **Dynamic selectors**: TUI.nl may change its CSS classes (`.sr-item-hdr`, `.pricebox`, `.board`, `.airports`, `.price-detail`) at any time
 - **Anti-bot protection**: While nodriver with a residential NL proxy currently bypasses Akamai, this may stop working if Akamai updates its detection

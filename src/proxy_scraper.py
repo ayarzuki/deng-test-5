@@ -180,144 +180,133 @@ async def extract_hotel_links(page):
 
 async def extract_flight_data(page, pricebox_index):
     """
-    Try to extract flight data by clicking the tooltip button inside table.prices
-    and waiting for the ovl-flightchoice popup to appear.
-
-    Strategy:
-    1. Look for data-tui-tooltip-element inside table.prices or within pricebox
-    2. Click it
-    3. Wait for .ovl-flightchoice.popup or form[action*="flightchoice"]
-    4. Extract flight details
-    5. Close the popup
+    Extract flight data from ovl-flightchoice popup.
+    Proven approach from debug testing:
+      1. Find SPAN.price-det[data-tui-tooltip-element] inside the pricebox
+      2. scrollIntoView + click it
+      3. Wait up to 24s for .ovl-flightchoice popup (AJAX takes ~6-8s)
+      4. Parse structured <tr> rows with radio inputs (airline, times, etc.)
+      5. Close popup via .close button
     """
-    # Try to find and click the tooltip button
+    # Step 1: Click the tooltip element inside this pricebox
     clicked = await safe_eval(page, f'''
         JSON.stringify((() => {{
-            // Strategy 1: table.prices inside or near pricebox
             let boxes = document.querySelectorAll('.pricebox');
             let box = boxes[{pricebox_index}];
-            let btn = null;
+            if (!box) return {{clicked: false, reason: 'no pricebox at index {pricebox_index}'}};
 
-            if (box) {{
-                // Look for tooltip element within the pricebox
-                btn = box.querySelector('[data-tui-tooltip-element]');
-                if (!btn) btn = box.querySelector('table.prices [data-tui-tooltip-element]');
-                if (!btn) btn = box.querySelector('.price [data-tui-tooltip-element]');
-                if (!btn) btn = box.querySelector('button[data-tui-tooltip-element]');
-            }}
-
-            // Strategy 2: Look in the broader pricing area
+            let btn = box.querySelector('[data-tui-tooltip-element]');
             if (!btn) {{
-                let priceTables = document.querySelectorAll('table.prices');
-                for (let t of priceTables) {{
-                    btn = t.querySelector('[data-tui-tooltip-element]');
-                    if (btn) break;
-                }}
+                // Fallback: try any tooltip on page at this index
+                let all = document.querySelectorAll('[data-tui-tooltip-element]');
+                if (all.length > 0) btn = all[Math.min({pricebox_index}, all.length - 1)];
             }}
+            if (!btn) return {{clicked: false, reason: 'no tooltip found', total: document.querySelectorAll('[data-tui-tooltip-element]').length}};
 
-            // Strategy 3: Any tooltip element near a price
-            if (!btn) {{
-                let allTooltips = document.querySelectorAll('[data-tui-tooltip-element]');
-                if (allTooltips.length > {pricebox_index} && allTooltips.length > 0) {{
-                    btn = allTooltips[Math.min({pricebox_index}, allTooltips.length - 1)];
-                }}
-            }}
-
-            if (btn) {{
-                btn.click();
-                return {{clicked: true, tag: btn.tagName, text: btn.textContent.trim().substring(0, 100)}};
-            }}
-            return {{clicked: false, tooltipCount: document.querySelectorAll('[data-tui-tooltip-element]').length, tablePricesCount: document.querySelectorAll('table.prices').length}};
+            btn.scrollIntoView({{block: 'center'}});
+            btn.click();
+            return {{clicked: true, target: btn.getAttribute('data-tui-tooltip-element')}};
         }})())
     ''')
 
     if not clicked or not clicked.get("clicked"):
-        logger.debug(f"    No tooltip button found for pricebox {pricebox_index}: {clicked}")
+        logger.info(f"    No tooltip for pricebox #{pricebox_index}: {clicked}")
         return None
 
-    logger.info(f"    Clicked tooltip: {clicked.get('tag')} — {clicked.get('text', '')[:50]}")
+    logger.info(f"    Clicked tooltip -> {clicked.get('target', '?')}")
 
-    # Wait for the flight choice popup to appear
+    # Step 2: Wait for ovl-flightchoice popup (AJAX, typically 6-8s)
     flight_data = None
-    for wait in range(8):
-        await page.sleep(1)
+    for wait_i in range(12):
+        await page.sleep(2)
         flight_data = await safe_eval(page, '''
             JSON.stringify((() => {
-                // Look for the flight choice popup
-                let popup = document.querySelector('.ovl-flightchoice.popup, .ovl-flightchoice');
+                let popup = document.querySelector('.ovl-flightchoice.popup')
+                           || document.querySelector('.ovl-flightchoice')
+                           || document.querySelector('[class*="ovl-flightchoice"]');
                 if (!popup) {
-                    // Try form-based lookup
-                    let forms = document.querySelectorAll('form[action*="flightchoice"]');
-                    if (forms.length > 0) popup = forms[0].closest('.popup, .ovl-flightchoice, [class*="overlay"]') || forms[0];
+                    let form = document.querySelector('form[action*="flightchoice"]');
+                    if (form) popup = form.closest('[class*="ovl"]') || form;
                 }
-                if (!popup) {
-                    // Any popup/overlay that appeared
-                    let overlays = document.querySelectorAll('[class*="flightchoice"], [class*="flight-choice"]');
-                    if (overlays.length > 0) popup = overlays[0];
-                }
+                if (!popup || popup.offsetHeight === 0) return null;
 
-                if (!popup) return null;
+                // Parse structured flight rows from the popup tables
+                // Popup has sections: .fc-cnt.dep (outbound) and .fc-cnt.ret (return)
+                let outbound = [];
+                let inbound = [];
 
-                let flights = [];
-                // Look for flight rows in the popup
-                let rows = popup.querySelectorAll('tr, .flight-row, [class*="flight"], li');
-                for (let row of rows) {
-                    let text = row.innerText.trim();
-                    if (!text || text.length < 5) continue;
+                let sections = popup.querySelectorAll('.fc-cnt');
+                for (let section of sections) {
+                    let isDep = section.classList.contains('dep');
+                    let target = isDep ? outbound : inbound;
 
-                    // Extract times (HH:MM patterns)
-                    let times = text.match(/(\\d{1,2}:\\d{2})/g) || [];
-                    // Extract airline name — look for known patterns
-                    let airline = '';
-                    let airlineEl = row.querySelector('[class*="airline"], [class*="carrier"], .airline');
-                    if (airlineEl) airline = airlineEl.textContent.trim();
+                    let route = '';
+                    let hdr = section.querySelector('.fc-hdr, .ic-flight');
+                    if (hdr) route = hdr.textContent.trim().replace(/\\s+/g, ' ');
 
-                    if (times.length >= 1 || airline) {
-                        flights.push({
-                            text: text.substring(0, 200),
-                            departure_time: times[0] || '',
-                            arrival_time: times[1] || '',
-                            airline: airline
+                    section.querySelectorAll('tr').forEach(row => {
+                        let input = row.querySelector('input[type="radio"]');
+                        if (!input) return;
+
+                        let label = row.querySelector('label');
+                        let airline = label ? label.textContent.trim() : '';
+                        if (!airline) {
+                            let carrier = input.getAttribute('data-tui-carrier');
+                            if (carrier) airline = carrier.charAt(0).toUpperCase() + carrier.slice(1);
+                        }
+
+                        let tds = row.querySelectorAll('td');
+                        let flightNo = tds.length > 1 ? tds[1].textContent.trim() : '';
+                        let flightClass = tds.length > 2 ? tds[2].textContent.trim() : '';
+                        let timeRange = tds.length > 3 ? tds[3].textContent.trim() : '';
+                        let duration = tds.length > 4 ? tds[4].textContent.trim() : '';
+                        let surcharge = tds.length > 5 ? tds[5].textContent.trim() : '';
+
+                        let times = timeRange.match(/(\\d{1,2}:\\d{2})/g) || [];
+                        let isActive = row.classList.contains('active') || input.checked;
+
+                        target.push({
+                            airline, flightNo, flightClass,
+                            dep: times[0] || '', arr: times[1] || '',
+                            duration, surcharge, isActive, route
                         });
-                    }
+                    });
                 }
 
-                // Also try to extract from the popup as a whole
-                let popupText = popup.innerText.substring(0, 2000);
-                let allTimes = popupText.match(/(\\d{1,2}:\\d{2})/g) || [];
-
-                // Look for airline names in popup
-                let popupAirline = '';
-                let airlineEls = popup.querySelectorAll('[class*="airline"], [class*="carrier"], .airline, img[alt]');
-                for (let el of airlineEls) {
-                    let name = el.alt || el.textContent.trim();
-                    if (name && name.length > 2 && name.length < 50) {
-                        popupAirline = name;
-                        break;
-                    }
+                // Flat fallback if no .fc-cnt sections found
+                if (outbound.length === 0 && inbound.length === 0) {
+                    popup.querySelectorAll('tr').forEach(row => {
+                        let input = row.querySelector('input[type="radio"]');
+                        if (!input) return;
+                        let label = row.querySelector('label');
+                        let tds = row.querySelectorAll('td');
+                        let timeRange = tds.length > 3 ? tds[3].textContent.trim() : '';
+                        let times = timeRange.match(/(\\d{1,2}:\\d{2})/g) || [];
+                        outbound.push({
+                            airline: label ? label.textContent.trim() : '',
+                            flightNo: tds.length > 1 ? tds[1].textContent.trim() : '',
+                            dep: times[0] || '', arr: times[1] || '',
+                            isActive: row.classList.contains('active') || input.checked,
+                        });
+                    });
                 }
 
-                return {
-                    found: true,
-                    flights: flights,
-                    allTimes: allTimes,
-                    airline: popupAirline,
-                    popupText: popupText.substring(0, 500),
-                    popupClass: popup.className
-                };
+                return {found: true, outbound, inbound};
             })())
         ''')
 
         if flight_data and flight_data.get("found"):
-            logger.info(f"    Flight popup found (class: {flight_data.get('popupClass', '')[:60]})")
+            n_out = len(flight_data.get("outbound", []))
+            n_in = len(flight_data.get("inbound", []))
+            logger.info(f"    Flight popup found: {n_out} outbound, {n_in} return flights")
             break
 
-    # Close the popup
+    # Step 3: Close the popup
     await safe_eval(page, '''
         (() => {
-            let close = document.querySelector('.ovl-flightchoice .close, .ovl-flightchoice [class*="close"], .popup .close, .popup [class*="close"], [class*="overlay"] .close');
-            if (close) { close.click(); return; }
-            // Try escape key
+            let btn = document.querySelector('.ovl-flightchoice .close')
+                   || document.querySelector('.ovl-flightchoice [data-tui-close-popup]');
+            if (btn) { btn.click(); return; }
             document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', keyCode: 27}));
         })()
     ''')
@@ -327,36 +316,19 @@ async def extract_flight_data(page, pricebox_index):
 
 
 def parse_flight_data(flight_data):
-    """Parse the flight popup data into departure_time, arrival_time, airline."""
+    """Pick active (cheapest) outbound flight -> {dep, arr, airline}."""
     if not flight_data or not flight_data.get("found"):
-        return "N/A", "N/A", "N/A"
+        return {}
 
-    dep_time = ""
-    arr_time = ""
-    airline = flight_data.get("airline", "")
+    for f in flight_data.get("outbound", []):
+        if f.get("isActive"):
+            return {"dep": f.get("dep", ""), "arr": f.get("arr", ""), "airline": f.get("airline", "")}
 
-    # Try structured flights first
-    flights = flight_data.get("flights", [])
+    flights = flight_data.get("outbound", [])
     if flights:
-        # Pick the first flight with time info (usually outbound)
-        for f in flights:
-            if f.get("departure_time"):
-                dep_time = f["departure_time"]
-                arr_time = f.get("arrival_time", "")
-                if f.get("airline"):
-                    airline = f["airline"]
-                break
+        return {"dep": flights[0].get("dep", ""), "arr": flights[0].get("arr", ""), "airline": flights[0].get("airline", "")}
 
-    # Fall back to allTimes from popup text
-    if not dep_time:
-        all_times = flight_data.get("allTimes", [])
-        if len(all_times) >= 2:
-            dep_time = all_times[0]
-            arr_time = all_times[1]
-        elif len(all_times) == 1:
-            dep_time = all_times[0]
-
-    return dep_time or "N/A", arr_time or "N/A", airline or "N/A"
+    return {}
 
 
 async def scrape_hotel(browser, hotel):
@@ -579,6 +551,14 @@ async def scrape_hotel(browser, hotel):
                 airport_buttons = expanded
                 logger.info(f"    Expanded airports: {[a['text'] for a in airport_buttons]}")
 
+        # Extract flight data ONCE per pricebox (before airport loop)
+        flight_info = {}
+        raw_flight = await extract_flight_data(page, pb["index"])
+        if raw_flight:
+            flight_info = parse_flight_data(raw_flight)
+            if flight_info.get("dep"):
+                logger.info(f"    Flight: {flight_info['airline']} {flight_info['dep']}->{flight_info['arr']}")
+
         for ap in airport_buttons:
             # Click this airport button
             ap_name = ap["text"].split("+")[0].strip()  # "Vanaf Rotterdam + 7,- p.p." -> "Vanaf Rotterdam"
@@ -649,17 +629,6 @@ async def scrape_hotel(browser, hotel):
             if not price_data:
                 price_data = {}
 
-            # Try to extract flight data from the tooltip popup
-            flight_dep = "N/A"
-            flight_arr = "N/A"
-            flight_airline = "N/A"
-
-            flight_data = await extract_flight_data(page, pb["index"])
-            if flight_data:
-                flight_dep, flight_arr, flight_airline = parse_flight_data(flight_data)
-                if flight_dep != "N/A":
-                    logger.info(f"    Flight: {flight_dep} -> {flight_arr}, {flight_airline}")
-
             pkg = {
                 "hotel_name": hotel_name,
                 "hotel_url": url,
@@ -670,9 +639,9 @@ async def scrape_hotel(browser, hotel):
                 "departure_date": pb.get("date", ""),
                 "departure_airport": ap_name,
                 "airport_surcharge": ap_extra_cost,
-                "flight_departure_time": flight_dep,
-                "flight_arrival_time": flight_arr,
-                "flight_airline": flight_airline,
+                "flight_departure_time": flight_info.get("dep") or "N/A",
+                "flight_arrival_time": flight_info.get("arr") or "N/A",
+                "flight_airline": flight_info.get("airline") or "N/A",
                 "final_price_per_person": price_data.get("mainPrice"),
                 "tourist_tax": price_data.get("touristTax"),
                 "currency": "EUR",
